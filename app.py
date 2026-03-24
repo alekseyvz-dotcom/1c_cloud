@@ -1,3 +1,4 @@
+import base64
 import json
 import re
 import threading
@@ -109,14 +110,15 @@ def response_summary(response: requests.Response) -> dict:
 
 def extract_interesting_headers(headers: dict) -> dict:
     interesting = {}
-    for key in ["WWW-Authenticate", "Set-Cookie", "Location", "Content-Type", "Server"]:
+    keys = ["WWW-Authenticate", "Set-Cookie", "Location", "Content-Type", "Server", "Allow"]
+    for key in keys:
         for h, v in headers.items():
             if h.lower() == key.lower():
                 interesting[h] = v
     return interesting
 
 
-def try_request(session: requests.Session, method: str, url: str, timeout: int, verify_ssl: bool, logger: ProbeLogger, label: str):
+def try_request(session: requests.Session, method: str, url: str, timeout: int, verify_ssl: bool, logger: ProbeLogger, label: str, headers: dict | None = None, auth=None):
     try:
         response = session.request(
             method=method,
@@ -124,6 +126,8 @@ def try_request(session: requests.Session, method: str, url: str, timeout: int, 
             timeout=timeout,
             allow_redirects=True,
             verify=verify_ssl,
+            headers=headers,
+            auth=auth,
         )
         logger.log(f"[OK] {label}: {method} {url} -> {response.status_code} -> {response.url}")
         return response, None
@@ -148,15 +152,6 @@ def build_url_variants(original_url: str, base_href: str | None) -> list[str]:
     return variants
 
 
-def can_attempt_basic_auth(username: str, password: str) -> tuple[bool, str]:
-    try:
-        username.encode("latin-1")
-        password.encode("latin-1")
-        return True, ""
-    except UnicodeEncodeError:
-        return False, "Логин или пароль содержат символы вне latin-1; стандартный Basic Auth тест пропущен."
-
-
 def save_http_body(output_dir: Path, prefix: str, response: requests.Response) -> Path:
     content_type = response.headers.get("Content-Type", "").lower()
     ext = ".txt"
@@ -173,19 +168,70 @@ def save_http_body(output_dir: Path, prefix: str, response: requests.Response) -
     return save_text_file(output_dir, filename, response.text)
 
 
-def run_probe(base_url: str, username: str, password: str, verify_ssl: bool, timeout: int, output_dir: Path, logger: ProbeLogger):
+def parse_extra_paths(raw_text: str) -> list[str]:
+    result = []
+    for line in raw_text.splitlines():
+        item = line.strip()
+        if not item:
+            continue
+        if item.startswith("/"):
+            item = item[1:]
+        result.append(item)
+    return result
+
+
+def build_manual_basic_auth_header(username: str, password: str, encoding_name: str) -> tuple[dict | None, str | None]:
+    try:
+        raw = f"{username}:{password}".encode(encoding_name)
+        token = base64.b64encode(raw).decode("ascii")
+        return {"Authorization": f"Basic {token}"}, None
+    except Exception as e:
+        return None, str(e)
+
+
+def log_interesting_response_info(logger: ProbeLogger, response: requests.Response):
+    interesting = extract_interesting_headers(dict(response.headers))
+    if interesting:
+        logger.log("  Интересные заголовки:")
+        for k, v in interesting.items():
+            logger.log(f"    {k}: {v}")
+
+
+def add_probe_entry(report: dict, category: str, base_variant: str, path: str, method: str, mode: str, url: str, resp, err, body_saved_to: str | None = None):
+    entry = {
+        "category": category,
+        "base_variant": base_variant,
+        "path": path or "/",
+        "method": method,
+        "mode": mode,
+        "url": url,
+        "error": err,
+    }
+    if resp is not None:
+        entry.update(response_summary(resp))
+        entry["interesting_headers"] = extract_interesting_headers(dict(resp.headers))
+        entry["body_saved_to"] = body_saved_to
+    report["probes"].append(entry)
+
+
+def run_probe(base_url: str, username: str, password: str, verify_ssl: bool, timeout: int, output_dir: Path, logger: ProbeLogger, extra_paths: list[str], enable_requests_auth: bool, enable_manual_latin1: bool, enable_manual_utf8: bool):
     report = {
         "started_at": datetime.now().isoformat(),
         "base_url": base_url,
         "username_masked": mask_username(username),
         "verify_ssl": verify_ssl,
         "timeout_seconds": timeout,
+        "extra_paths": extra_paths,
+        "auth_modes": {
+            "requests_auth": enable_requests_auth,
+            "manual_basic_latin1": enable_manual_latin1,
+            "manual_basic_utf8": enable_manual_utf8,
+        },
         "start_page": None,
         "detected_base_href": None,
         "detected_version": None,
         "url_variants": [],
         "probes": [],
-        "basic_auth": None,
         "notes": [],
     }
 
@@ -197,12 +243,13 @@ def run_probe(base_url: str, username: str, password: str, verify_ssl: bool, tim
     logger.log(f"Проверка SSL: {verify_ssl}")
     logger.log(f"Таймаут: {timeout} сек")
     logger.log(f"Папка вывода: {output_dir}")
+    logger.log(f"Дополнительные пути: {', '.join(extra_paths) if extra_paths else '(нет)'}")
 
     ensure_output_dir(output_dir)
 
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) 1C-Probe/2.0"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) 1C-Probe/3.0"
     })
 
     logger.log("Шаг 1. Проверка стартовой страницы")
@@ -236,9 +283,7 @@ def run_probe(base_url: str, username: str, password: str, verify_ssl: bool, tim
         logger.log(f"Финальный URL: {start_response.url}")
         logger.log(f"Статус: {start_response.status_code}")
 
-        logger.log("Интересные заголовки ответа:")
-        for k, v in extract_interesting_headers(dict(start_response.headers)).items():
-            logger.log(f"  {k}: {v}")
+        log_interesting_response_info(logger, start_response)
 
         if base_href:
             logger.log(f"Обнаружен base href: {base_href}")
@@ -261,9 +306,7 @@ def run_probe(base_url: str, username: str, password: str, verify_ssl: bool, tim
     url_variants = build_url_variants(base_url, base_href)
     report["url_variants"] = url_variants
 
-    logger.log("Шаг 2. Проверка URL-вариантов и типовых путей")
-
-    probe_paths = [
+    default_probe_paths = [
         "",
         "hs/",
         "odata/",
@@ -274,77 +317,152 @@ def run_probe(base_url: str, username: str, password: str, verify_ssl: bool, tim
     ]
 
     if version:
-        probe_paths.append(f"scripts/mod_bootstrap_bootstrap.js?sysver={version}")
+        default_probe_paths.append(f"scripts/mod_bootstrap_bootstrap.js?sysver={version}")
     else:
-        probe_paths.append("scripts/mod_bootstrap_bootstrap.js")
+        default_probe_paths.append("scripts/mod_bootstrap_bootstrap.js")
 
+    all_custom_paths = list(dict.fromkeys(extra_paths))
+    methods_common = ["GET", "HEAD", "OPTIONS"]
+
+    logger.log("Шаг 2. Базовая проверка типовых путей без авторизации")
     for base_variant in url_variants:
         logger.log(f"Базовый вариант: {base_variant}")
 
-        for path in probe_paths:
+        for path in default_probe_paths:
             full_url = urljoin(base_variant, path)
 
-            for method in ["GET", "HEAD", "OPTIONS"]:
-                label = f"{method} [{path or '/'}]"
+            for method in methods_common:
+                label = f"DEFAULT {method} [{path or '/'}]"
                 resp, err = try_request(session, method, full_url, timeout, verify_ssl, logger, label)
 
-                entry = {
-                    "base_variant": base_variant,
-                    "path": path or "/",
-                    "method": method,
-                    "url": full_url,
-                    "error": err,
-                }
-
+                body_saved_to = None
                 if resp is not None:
-                    entry.update(response_summary(resp))
-                    entry["interesting_headers"] = extract_interesting_headers(dict(resp.headers))
-
-                    body_saved_to = None
                     if method == "GET":
                         body_saved_to = str(save_http_body(
                             output_dir,
-                            prefix=f"{urlparse(base_variant).path}_{path}_{method}",
+                            prefix=f"default_{urlparse(base_variant).path}_{path}_{method}",
                             response=resp
                         ))
-                    entry["body_saved_to"] = body_saved_to
+                    if resp.status_code in (200, 401, 403, 404, 405):
+                        log_interesting_response_info(logger, resp)
 
-                    if resp.status_code == 401:
-                        logger.log("  -> Обнаружен 401 Unauthorized")
-                        hdrs = extract_interesting_headers(dict(resp.headers))
-                        if hdrs:
-                            for k, v in hdrs.items():
-                                logger.log(f"     {k}: {v}")
+                add_probe_entry(report, "default", base_variant, path, method, "no_auth", full_url, resp, err, body_saved_to)
 
-                report["probes"].append(entry)
+    if all_custom_paths:
+        logger.log("Шаг 3. Проверка пользовательских путей")
 
-    logger.log("Шаг 3. Проверка Basic Auth")
-    can_basic, reason = can_attempt_basic_auth(username, password)
-    if not can_basic:
-        logger.log(f"[SKIP] BASIC AUTH: {reason}")
-        report["basic_auth"] = {"skipped": True, "reason": reason}
-    else:
-        auth_session = requests.Session()
-        auth_session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) 1C-Probe/2.0"
-        })
-        try:
-            response = auth_session.get(
-                base_url,
-                auth=(username, password),
-                timeout=timeout,
-                allow_redirects=True,
-                verify=verify_ssl,
-            )
-            logger.log(f"[OK] BASIC AUTH: GET {base_url} -> {response.status_code} -> {response.url}")
-            report["basic_auth"] = response_summary(response)
-            report["basic_auth"]["interesting_headers"] = extract_interesting_headers(dict(response.headers))
-            auth_path = save_http_body(output_dir, "basic_auth_response", response)
-            report["basic_auth"]["body_saved_to"] = str(auth_path)
-            logger.log(f"Сохранен ответ basic auth: {auth_path}")
-        except Exception as e:
-            logger.log(f"[ERR] BASIC AUTH: {e}")
-            report["basic_auth"] = {"error": str(e)}
+    for base_variant in url_variants:
+        if not all_custom_paths:
+            break
+
+        logger.log(f"Пользовательские пути для базы: {base_variant}")
+
+        for path in all_custom_paths:
+            full_url = urljoin(base_variant, path)
+
+            # 1) Без авторизации
+            for method in methods_common:
+                label = f"CUSTOM NO_AUTH {method} [{path}]"
+                resp, err = try_request(session, method, full_url, timeout, verify_ssl, logger, label)
+
+                body_saved_to = None
+                if resp is not None:
+                    if method == "GET":
+                        body_saved_to = str(save_http_body(
+                            output_dir,
+                            prefix=f"custom_noauth_{urlparse(base_variant).path}_{path}_{method}",
+                            response=resp
+                        ))
+                    log_interesting_response_info(logger, resp)
+
+                add_probe_entry(report, "custom", base_variant, path, method, "no_auth", full_url, resp, err, body_saved_to)
+
+            # 2) requests auth
+            if enable_requests_auth:
+                for method in ["GET"]:
+                    label = f"CUSTOM REQ_AUTH {method} [{path}]"
+                    try:
+                        resp, err = try_request(
+                            session,
+                            method,
+                            full_url,
+                            timeout,
+                            verify_ssl,
+                            logger,
+                            label,
+                            auth=(username, password),
+                        )
+                    except Exception as e:
+                        resp, err = None, str(e)
+
+                    body_saved_to = None
+                    if resp is not None:
+                        body_saved_to = str(save_http_body(
+                            output_dir,
+                            prefix=f"custom_reqauth_{urlparse(base_variant).path}_{path}_{method}",
+                            response=resp
+                        ))
+                        log_interesting_response_info(logger, resp)
+
+                    add_probe_entry(report, "custom", base_variant, path, method, "requests_auth", full_url, resp, err, body_saved_to)
+
+            # 3) Manual Basic latin-1
+            if enable_manual_latin1:
+                headers, auth_err = build_manual_basic_auth_header(username, password, "latin-1")
+                if headers is None:
+                    logger.log(f"[SKIP] CUSTOM MANUAL_BASIC_LATIN1 [${path}] -> {auth_err}")
+                    add_probe_entry(report, "custom", base_variant, path, "GET", "manual_basic_latin1", full_url, None, auth_err, None)
+                else:
+                    label = f"CUSTOM MANUAL_BASIC_LATIN1 GET [{path}]"
+                    resp, err = try_request(
+                        session,
+                        "GET",
+                        full_url,
+                        timeout,
+                        verify_ssl,
+                        logger,
+                        label,
+                        headers=headers,
+                    )
+                    body_saved_to = None
+                    if resp is not None:
+                        body_saved_to = str(save_http_body(
+                            output_dir,
+                            prefix=f"custom_manual_latin1_{urlparse(base_variant).path}_{path}_GET",
+                            response=resp
+                        ))
+                        log_interesting_response_info(logger, resp)
+
+                    add_probe_entry(report, "custom", base_variant, path, "GET", "manual_basic_latin1", full_url, resp, err, body_saved_to)
+
+            # 4) Manual Basic UTF-8
+            if enable_manual_utf8:
+                headers, auth_err = build_manual_basic_auth_header(username, password, "utf-8")
+                if headers is None:
+                    logger.log(f"[SKIP] CUSTOM MANUAL_BASIC_UTF8 [{path}] -> {auth_err}")
+                    add_probe_entry(report, "custom", base_variant, path, "GET", "manual_basic_utf8", full_url, None, auth_err, None)
+                else:
+                    label = f"CUSTOM MANUAL_BASIC_UTF8 GET [{path}]"
+                    resp, err = try_request(
+                        session,
+                        "GET",
+                        full_url,
+                        timeout,
+                        verify_ssl,
+                        logger,
+                        label,
+                        headers=headers,
+                    )
+                    body_saved_to = None
+                    if resp is not None:
+                        body_saved_to = str(save_http_body(
+                            output_dir,
+                            prefix=f"custom_manual_utf8_{urlparse(base_variant).path}_{path}_GET",
+                            response=resp
+                        ))
+                        log_interesting_response_info(logger, resp)
+
+                    add_probe_entry(report, "custom", base_variant, path, "GET", "manual_basic_utf8", full_url, resp, err, body_saved_to)
 
     report["finished_at"] = datetime.now().isoformat()
 
@@ -361,8 +479,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("980x760")
-        self.minsize(860, 620)
+        self.geometry("1050x840")
+        self.minsize(900, 680)
 
         self.var_url = tk.StringVar()
         self.var_username = tk.StringVar()
@@ -370,6 +488,10 @@ class App(tk.Tk):
         self.var_verify_ssl = tk.BooleanVar(value=True)
         self.var_timeout = tk.StringVar(value="20")
         self.var_output_dir = tk.StringVar(value=str(Path.cwd() / "output"))
+
+        self.var_enable_requests_auth = tk.BooleanVar(value=True)
+        self.var_enable_manual_latin1 = tk.BooleanVar(value=True)
+        self.var_enable_manual_utf8 = tk.BooleanVar(value=True)
 
         self._build_ui()
 
@@ -381,7 +503,7 @@ class App(tk.Tk):
         top.pack(fill="x", pady=(0, 10))
 
         ttk.Label(top, text="URL:").grid(row=0, column=0, sticky="e", padx=6, pady=6)
-        ttk.Entry(top, textvariable=self.var_url, width=90).grid(row=0, column=1, columnspan=2, sticky="we", padx=6, pady=6)
+        ttk.Entry(top, textvariable=self.var_url, width=95).grid(row=0, column=1, columnspan=3, sticky="we", padx=6, pady=6)
 
         ttk.Label(top, text="Логин:").grid(row=1, column=0, sticky="e", padx=6, pady=6)
         ttk.Entry(top, textvariable=self.var_username, width=40).grid(row=1, column=1, sticky="w", padx=6, pady=6)
@@ -397,10 +519,41 @@ class App(tk.Tk):
         )
 
         ttk.Label(top, text="Папка результата:").grid(row=5, column=0, sticky="e", padx=6, pady=6)
-        ttk.Entry(top, textvariable=self.var_output_dir, width=70).grid(row=5, column=1, sticky="we", padx=6, pady=6)
-        ttk.Button(top, text="Выбрать...", command=self.choose_output_dir).grid(row=5, column=2, sticky="w", padx=6, pady=6)
+        ttk.Entry(top, textvariable=self.var_output_dir, width=72).grid(row=5, column=1, columnspan=2, sticky="we", padx=6, pady=6)
+        ttk.Button(top, text="Выбрать...", command=self.choose_output_dir).grid(row=5, column=3, sticky="w", padx=6, pady=6)
 
-        top.columnconfigure(1, weight=1)
+        auth_box = ttk.LabelFrame(top, text="Режимы авторизации для пользовательских путей")
+        auth_box.grid(row=6, column=0, columnspan=4, sticky="we", padx=6, pady=8)
+
+        ttk.Checkbutton(auth_box, text="requests auth (стандартный BasicAuth requests)", variable=self.var_enable_requests_auth).grid(
+            row=0, column=0, sticky="w", padx=8, pady=4
+        )
+        ttk.Checkbutton(auth_box, text="manual basic latin-1", variable=self.var_enable_manual_latin1).grid(
+            row=0, column=1, sticky="w", padx=8, pady=4
+        )
+        ttk.Checkbutton(auth_box, text="manual basic utf-8", variable=self.var_enable_manual_utf8).grid(
+            row=0, column=2, sticky="w", padx=8, pady=4
+        )
+
+        extra_box = ttk.LabelFrame(frm, text="Дополнительные пути для проверки (по одному на строку)")
+        extra_box.pack(fill="x", pady=(0, 10))
+
+        self.txt_paths = tk.Text(extra_box, height=8, wrap="none")
+        self.txt_paths.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+
+        paths_scroll = ttk.Scrollbar(extra_box, orient="vertical", command=self.txt_paths.yview)
+        paths_scroll.pack(side="right", fill="y", padx=(0, 6), pady=6)
+        self.txt_paths.configure(yscrollcommand=paths_scroll.set)
+
+        self.txt_paths.insert(
+            "1.0",
+            "hs/employees\n"
+            "hs/integration/employees\n"
+            "hs/staff\n"
+            "hs/api/employees\n"
+            "hs/catalog/employees\n"
+            "hs/employee/list\n"
+        )
 
         buttons = ttk.Frame(frm)
         buttons.pack(fill="x", pady=(0, 10))
@@ -420,6 +573,9 @@ class App(tk.Tk):
         scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.txt_log.yview)
         scroll.pack(side="right", fill="y")
         self.txt_log.configure(yscrollcommand=scroll.set)
+
+        top.columnconfigure(1, weight=1)
+        top.columnconfigure(2, weight=1)
 
     def choose_output_dir(self):
         path = filedialog.askdirectory(title="Выберите папку для результатов")
@@ -443,6 +599,7 @@ class App(tk.Tk):
         username = self.var_username.get().strip()
         password = self.var_password.get()
         output_dir = Path(self.var_output_dir.get().strip())
+        extra_paths = parse_extra_paths(self.txt_paths.get("1.0", "end"))
 
         if not base_url:
             messagebox.showwarning(APP_TITLE, "Укажите URL")
@@ -471,6 +628,10 @@ class App(tk.Tk):
                     timeout=timeout,
                     output_dir=output_dir,
                     logger=logger,
+                    extra_paths=extra_paths,
+                    enable_requests_auth=self.var_enable_requests_auth.get(),
+                    enable_manual_latin1=self.var_enable_manual_latin1.get(),
+                    enable_manual_utf8=self.var_enable_manual_utf8.get(),
                 )
                 self.after(0, lambda: messagebox.showinfo(APP_TITLE, f"Проверка завершена.\nРезультаты сохранены в:\n{output_dir}"))
             except Exception as e:
